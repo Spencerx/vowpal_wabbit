@@ -278,6 +278,7 @@ void VW::details::save_load_header(VW::workspace& all, VW::io_buf& model_file, b
           bytes_read_write += VW::details::bin_text_read_write_fixed_validated(
               model_file, reinterpret_cast<char*>(&inter_len), sizeof(inter_len), read, msg, text);
 
+          if (read && inter_len > buff2.size()) { THROW("Bad model format: interaction length exceeds buffer."); }
           auto size =
               VW::details::bin_text_read_write_fixed_validated(model_file, buff2.data(), inter_len, read, msg, text);
           bytes_read_write += size;

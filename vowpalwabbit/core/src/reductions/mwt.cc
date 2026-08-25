@@ -240,6 +240,7 @@ void save_load(mwt& c, VW::io_buf& model_file, bool read, bool text)
   // c.evals is already initialized nicely to the same size as the regressor.
   for (VW::feature_index& policy : c.policies)
   {
+    if (policy >= c.evals.size()) { THROW("Bad model format: mwt policy id out of range."); }
     policy_data& pd = c.evals[policy];
     if (read) { msg << "evals: " << policy << ":" << pd.action << ":" << pd.cost << " "; }
     VW::details::bin_text_read_write_fixed_validated(

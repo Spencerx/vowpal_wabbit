@@ -3,6 +3,8 @@
 // license as described in the file LICENSE.
 
 #include "vw/config/options_cli.h"
+#include "vw/core/io_buf.h"
+#include "vw/core/parse_regressor.h"
 #include "vw/core/shared_data.h"
 #include "vw/core/vw.h"
 #include "vw/test_common/test_common.h"
@@ -11,7 +13,13 @@
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
 
+#include <algorithm>
+#include <array>
+#include <cstdint>
+#include <cstring>
+#include <iterator>
 #include <memory>
+#include <vector>
 
 using namespace ::testing;
 
@@ -84,4 +92,123 @@ TEST(SaveLoad, SaveResumeBehavesAsIfDatasetConcatenated)
 
   EXPECT_EQ(vw_all_data_single_run->sd->weighted_examples(), vw_second_half_from_loaded->sd->weighted_examples());
   EXPECT_EQ(vw_all_data_single_run->sd->sum_loss, vw_second_half_from_loaded->sd->sum_loss);
+}
+
+namespace
+{
+template <typename T>
+void append_pod(std::vector<char>& buf, T value)
+{
+  const char* p = reinterpret_cast<const char*>(&value);
+  buf.insert(buf.end(), p, p + sizeof(T));
+}
+}  // namespace
+
+// Regression test for GHSA-x3cx-p52g-p5q7: save_load_header reads a file-controlled legacy-interaction
+// length (inter_len) and copies that many bytes into the fixed 512-byte header buffer buff2 with no
+// bound. A crafted model with inter_len > 512 and enough trailing bytes overflows buff2 with
+// attacker-controlled data (heap out-of-bounds write). The load must instead reject the oversized length
+// with a clean VW exception before the copy.
+//
+// The crafted model claims file version 7.10.2 (the only version that reaches the legacy pair/triple/
+// interaction read path). 7.10.2 is below VERSION_FILE_WITH_HEADER_CHAINED_HASH (8.0.2) and
+// VERSION_FILE_WITH_HEADER_ID (8.0.3), so no header checksum or id block is required, and
+// validate_version only rejects versions older than 7.6.0.
+TEST(SaveLoad, CraftedModelOversizedInteractionLengthIsRejected)
+{
+  constexpr uint32_t OVERSIZED_INTER_LEN = 4096;  // > 512-byte buff2
+
+  std::vector<char> model;
+  // Version block: bin_read expects a uint32 length prefix followed by that many bytes.
+  const std::string version = "7.10.2";
+  append_pod<uint32_t>(model, static_cast<uint32_t>(version.size() + 1));
+  model.insert(model.end(), version.begin(), version.end());
+  model.push_back('\0');
+  // Model marker.
+  model.push_back('m');
+  // Min/max label (float each).
+  append_pod<float>(model, 0.0f);
+  append_pod<float>(model, 0.0f);
+  // Bit precision (uint32).
+  append_pod<uint32_t>(model, 18u);
+  // Legacy interaction block (version < 7.10.3): pair count, then triple count, both empty.
+  append_pod<uint32_t>(model, 0u);  // pair_len
+  append_pod<uint32_t>(model, 0u);  // triple_len
+  // Interactions among pairs/triples (version >= 7.10.2): one interaction with an oversized length.
+  append_pod<uint32_t>(model, 1u);                   // number of interactions
+  append_pod<uint32_t>(model, OVERSIZED_INTER_LEN);  // inter_len (attacker-controlled, > buff2.size())
+  // Trailing bytes so the unbounded read would have OVERSIZED_INTER_LEN bytes available to copy.
+  model.insert(model.end(), OVERSIZED_INTER_LEN, 'A');
+
+  auto vw = VW::initialize(vwtest::make_args("--no_stdin", "--quiet"));
+
+  VW::io_buf model_file;
+  model_file.add_file(VW::io::create_buffer_view(model.data(), model.size()));
+
+  std::string file_options;
+  EXPECT_THROW(VW::details::save_load_header(*vw, model_file, /*read*/ true, /*text*/ false, file_options, *vw->options),
+      VW::vw_exception);
+}
+
+// Regression test for the additional sink reported with GHSA-x3cx-p52g-p5q7: mwt::save_load reads a
+// file-controlled list of 64-bit policy ids and uses each as an index into c.evals (sized to the weight
+// table) with no bounds check, so a policy id past the end of c.evals is an attacker-directed heap
+// out-of-bounds access. --multiworld_test is a persisted (keep()) option embedded in the model header,
+// so a single crafted model reaches this path. The load must reject an out-of-range policy id with a
+// clean VW exception.
+//
+// A valid --multiworld_test model is trained first (so every preceding byte of the model is well-formed),
+// then a single policy id in the serialized mwt block is overwritten with an out-of-range value. The mwt
+// block is located structurally by its (total, policies_size) prefix rather than a fixed offset.
+TEST(SaveLoad, CraftedModelMwtPolicyIdOutOfRangeIsRejected)
+{
+  // Decision-service style CB eval data (matches test/train-sets/cb_eval): eight labeled observations,
+  // two distinct policy features (":1" and ":2") in the evaluated namespace "f".
+  const std::array<std::string, 8> cb_eval = {"1:0:0.5 |f :1 :2", "2:1:0.5 |f :1 :2", "1:0:0.5 |f :1 :2",
+      "2:1:0.5 |f :1 :2", "1:0:0.5 |f :1 :2", "2:1:0.5 |f :1 :2", "1:0:0.5 |f :1 :2", "2:1:0.5 |f :1 :2"};
+
+  auto vw_train = VW::initialize(vwtest::make_args("--multiworld_test", "f", "--no_stdin", "--quiet"));
+  for (const auto& line : cb_eval)
+  {
+    auto& ex = VW::get_unused_example(vw_train.get());
+    VW::parsers::text::read_line(*vw_train, &ex, line.c_str());
+    VW::setup_example(*vw_train, &ex);
+    vw_train->learn(ex);
+    vw_train->finish_example(ex);
+  }
+
+  auto backing_vector = std::make_shared<std::vector<char>>();
+  VW::io_buf io_writer;
+  io_writer.add_file(VW::io::create_vector_writer(backing_vector));
+  VW::save_predictor(*vw_train, io_writer);
+  io_writer.flush();
+
+  // The mwt block is: total (double) | policies_size (size_t) | policies (size_t each) | per-policy data.
+  // Eight observations were learned (total == 8.0) and there are two policies, giving a unique 16-byte
+  // prefix that locates the block regardless of its offset in the model.
+  const double expected_total = 8.0;
+  const uint64_t expected_policies_size = 2;
+  std::vector<char> signature(sizeof(double) + sizeof(uint64_t));
+  std::memcpy(signature.data(), &expected_total, sizeof(double));
+  std::memcpy(signature.data() + sizeof(double), &expected_policies_size, sizeof(uint64_t));
+
+  auto& model = *backing_vector;
+  auto sig_begin = std::search(model.begin(), model.end(), signature.begin(), signature.end());
+  ASSERT_NE(sig_begin, model.end()) << "mwt block signature not found in serialized model";
+  ASSERT_EQ(std::search(sig_begin + 1, model.end(), signature.begin(), signature.end()), model.end())
+      << "mwt block signature is not unique; test needs updating";
+
+  // Overwrite the first policy id (immediately after the 16-byte prefix) with a value far larger than any
+  // possible c.evals index (c.evals is sized to 2^num_bits, at most a few million for default bit widths).
+  const size_t first_policy_offset =
+      static_cast<size_t>(std::distance(model.begin(), sig_begin)) + signature.size();
+  ASSERT_LE(first_policy_offset + sizeof(uint64_t), model.size());
+  const uint64_t out_of_range_policy = 0xFFFFFFFFFFFFFFFFULL;
+  std::memcpy(model.data() + first_policy_offset, &out_of_range_policy, sizeof(uint64_t));
+
+  // Loading the corrupted model re-enables --multiworld_test from the persisted header and must reject the
+  // out-of-range policy id instead of indexing past the end of c.evals.
+  EXPECT_THROW(VW::initialize(vwtest::make_args("--no_stdin", "--quiet"),
+                   VW::io::create_buffer_view(model.data(), model.size())),
+      VW::vw_exception);
 }
