@@ -3,12 +3,16 @@
 // license as described in the file LICENSE.
 
 #include "vw/core/reductions/conditional_contextual_bandit.h"
+#include "vw/core/vw.h"
+#include "vw/json_parser/parse_example_json.h"
 #include "vw/test_common/matchers.h"
 #include "vw/test_common/test_common.h"
 
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
 
+#include <functional>
+#include <string>
 #include <vector>
 
 TEST(ParseDsjson, UnderscoreP)
@@ -1068,5 +1072,70 @@ TEST(ParseDsjson, CbWithObservationsNoLabel)
   EXPECT_EQ(examples[0]->l.cb_with_observations.event.costs.size(), 1);
   EXPECT_FLOAT_EQ(examples[0]->l.cb_with_observations.event.costs[0].probability, -1.f);
   EXPECT_FLOAT_EQ(examples[0]->l.cb_with_observations.event.costs[0].cost, FLT_MAX);
+  VW::finish_example(*vw, examples);
+}
+
+// Regression test for GHSA-c8v3-p4fg-v3pm: a slates DSJSON "_outcomes" object whose "_p"
+// (probabilities) array is longer than its "_a" (actions) array caused a heap out-of-bounds write in
+// parse_slates_example_dsjson. The per-slot probability v_array is grown by one entry per action, but
+// the probabilities were written back with destination[j] for every element of _p; the guarding assert
+// is compiled out under NDEBUG. The parser must now reject the mismatch with a clean VW exception
+// instead of writing past the end of the heap allocation.
+TEST(ParseDsjson, SlatesMismatchedProbabilitiesThrows)
+{
+  // _a has a single action, _p has twenty probabilities: without the fix this writes 19 floats past the
+  // end of the 1-element (capacity 3) v_array<action_score>.
+  const std::string json_text =
+      R"({"c":{"shared_feature":1.0,"_multi":[{"_slot_id":0,"feature":1.0}],"_slots":[{"feature":1.0}]},)"
+      R"("_outcomes":[{"_a":[0],"_p":[0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5]}]})";
+
+  auto vw = VW::initialize(vwtest::make_args("--slates", "--dsjson", "--chain_hash", "--no_stdin", "--quiet"));
+
+  VW::multi_ex examples;
+  examples.push_back(&VW::get_unused_example(vw.get()));
+  VW::parsers::json::decision_service_interaction interaction;
+  EXPECT_THROW(VW::parsers::json::read_line_decision_service_json<true>(*vw, examples, (char*)json_text.c_str(),
+                   json_text.size(), false, std::bind(VW::get_unused_example, vw.get()), &interaction),
+      VW::vw_exception);
+
+  for (auto* example : examples) { VW::finish_example(*vw, *example); }
+}
+
+// Companion to the above: a scalar "_p" is only valid when at least one action is present in "_a".
+// An empty "_a" with a scalar "_p" previously wrote to destination[0] of an empty v_array.
+TEST(ParseDsjson, SlatesScalarProbabilityWithEmptyActionsThrows)
+{
+  const std::string json_text =
+      R"({"c":{"shared_feature":1.0,"_multi":[{"_slot_id":0,"feature":1.0}],"_slots":[{"feature":1.0}]},)"
+      R"("_outcomes":[{"_a":[],"_p":0.5}]})";
+
+  auto vw = VW::initialize(vwtest::make_args("--slates", "--dsjson", "--chain_hash", "--no_stdin", "--quiet"));
+
+  VW::multi_ex examples;
+  examples.push_back(&VW::get_unused_example(vw.get()));
+  VW::parsers::json::decision_service_interaction interaction;
+  EXPECT_THROW(VW::parsers::json::read_line_decision_service_json<true>(*vw, examples, (char*)json_text.c_str(),
+                   json_text.size(), false, std::bind(VW::get_unused_example, vw.get()), &interaction),
+      VW::vw_exception);
+
+  for (auto* example : examples) { VW::finish_example(*vw, *example); }
+}
+
+// Negative control: a well-formed outcome where |_p| == |_a| must still parse and populate the
+// per-slot probabilities, confirming the validation does not reject valid slates DSJSON.
+TEST(ParseDsjson, SlatesMatchedProbabilitiesParses)
+{
+  const std::string json_text =
+      R"({"c":{"shared_feature":1.0,"_multi":[{"_slot_id":0,"feature":1.0},{"_slot_id":0,"feature":1.0}],)"
+      R"("_slots":[{"feature":1.0}]},"_outcomes":[{"_a":[0,1],"_p":[0.6,0.4]}]})";
+
+  auto vw = VW::initialize(vwtest::make_args("--slates", "--dsjson", "--chain_hash", "--no_stdin", "--quiet"));
+  auto examples = vwtest::parse_dsjson(*vw, json_text);
+
+  // shared + 2 actions + 1 slot
+  EXPECT_EQ(examples.size(), 4);
+  const auto& slot_label = examples[3]->l.slates;
+  EXPECT_THAT(slot_label.probabilities,
+      ::testing::Pointwise(ActionScoreEqual(), std::vector<VW::action_score>{{0, 0.6f}, {1, 0.4f}}));
   VW::finish_example(*vw, examples);
 }

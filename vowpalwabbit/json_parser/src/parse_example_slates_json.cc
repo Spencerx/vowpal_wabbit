@@ -273,7 +273,13 @@ void VW::parsers::json::details::parse_slates_example_dsjson(VW::workspace& all,
   if (document.HasMember("_outcomes"))
   {
     const auto& outcomes = document["_outcomes"].GetArray();
-    assert(outcomes.Size() == slot_examples.size());
+    // Attacker-controlled input: the number of _outcomes must match the number of slots. Under NDEBUG the
+    // asserts below are compiled out, so validate at runtime to prevent an out-of-bounds write (GHSA-c8v3-p4fg-v3pm).
+    if (outcomes.Size() != slot_examples.size())
+    {
+      THROW("Slates: number of _outcomes (" << outcomes.Size() << ") does not match number of slots ("
+                                            << slot_examples.size() << ").");
+    }
     for (rapidjson::SizeType i = 0; i < outcomes.Size(); i++)
     {
       auto& current_obj = outcomes[i];
@@ -290,12 +296,20 @@ void VW::parsers::json::details::parse_slates_example_dsjson(VW::workspace& all,
       auto& probs = current_obj["_p"];
       if (probs.GetType() == rapidjson::kNumberType)
       {
-        assert(destination.size() != 0);
+        // destination is sized to the number of actions _a; a scalar _p requires at least one action.
+        if (destination.size() == 0) { THROW("Slates: _p provided but _a is empty for slot " << i << "."); }
         destination[0].score = probs.GetFloat();
       }
       else if (probs.GetType() == rapidjson::kArrayType)
       {
-        assert(probs.Size() == destination.size());
+        // destination was grown by one entry per element of _a above. Writing destination[j] for every element
+        // of _p overflows the heap allocation when _p is longer than _a. The guarding assert is compiled out
+        // under NDEBUG, so validate at runtime (GHSA-c8v3-p4fg-v3pm).
+        if (probs.Size() != destination.size())
+        {
+          THROW("Slates: number of probabilities _p (" << probs.Size() << ") does not match number of actions _a ("
+                                                        << destination.size() << ") for slot " << i << ".");
+        }
         const auto& probs_array = probs.GetArray();
         for (rapidjson::SizeType j = 0; j < probs_array.Size(); j++)
         {
